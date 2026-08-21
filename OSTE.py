@@ -1,22 +1,11 @@
 #!/usr/bin/env python3
 """
-OS/FT Analyzer v8 — Open Source / Freeware Tool Security Analyzer
-Changes from v7:
-  1. LLM            — Groq only (removed OpenRouter + Gemini fallback)
-  2. Freeware flow  — takes installer DOWNLOAD URL as direct input
-                      (no auto-discovery) → download → VT upload → HA upload
-  3. Web intel (OS) — removed broken Shodan check
-  4. Vuln intel     — refactored: NVD pagination fixed, OSV batched, single
-                      CVSS-ladder helper, duplicates removed
-  5. Dependencies   — full repo-tree walk first, then OSV batch + Snyk + web
-                      reputation lookup for each vulnerable package
-  6. PDF report     — unchanged (same look as before)
 
 Usage:
-    python OSFWTE8.py
-    python OSFWTE8.py -n "VLC"
-    python OSFWTE8.py -u https://github.com/hcoles/pitest.git
-    python OSFWTE8.py -d https://videolan.org/.../vlc-3.0.20-win64.exe -n VLC
+    python OSTE.py
+    python OSTE.py -n "VLC"
+    python OSTE.py -u https://github.com/hcoles/pitest.git
+    python OSTE.py -d https://videolan.org/.../vlc-3.0.20-win64.exe -n VLC
 """
 
 # ── Self-relaunch in cmd window if double-clicked on Windows ─────────────────
@@ -63,9 +52,9 @@ def warn(m): print(f"  {YL}{B}[!]{R} {m}")
 def fail(m): print(f"  {RD}{B}[-]{R} {m}")
 
 # ── HARDCODED API KEYS (per user request) ─────────────────────────────────────
-GROQ_KEY      = "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"
-VT_KEY        = os.getenv("VT_API_KEY",   "b6d39ea0aff86f459c2f991e963f586b6127f03307a5b81dc5dcaa938a4aaa0b")
-HA_KEY        = os.getenv("HA_API_KEY",   "k5yq3o9mefd29601x8zxvile581067b1wt8v64kve1f58ba6x5j4bfob91f90239")
+GROQ_KEY      = "<Place your Groq Key >"
+VT_KEY        = os.getenv("VT_API_KEY",   "<key>")
+HA_KEY        = os.getenv("HA_API_KEY",   "<key>")
 NVD_KEY       = os.getenv("NVD_API_KEY",  "")
 GH_TOKEN      = os.getenv("GITHUB_TOKEN", "")
 SNYK_TOKEN    = os.getenv("SNYK_TOKEN", "")
@@ -255,44 +244,494 @@ def get_license_info(license_name, spdx_id=""):
 BANNER = (
     "\n" + CY + B +
     "  ╔══════════════════════════════════════════════════════════════════╗\n"
-    "  ║              OS/FT  ANALYZER   v8                                ║\n"
+    "  ║              OS/FT  ANALYZER   v9                                ║\n"
     "  ║   Open Source / Freeware Tool Security Analyzer                  ║\n"
     "  ╚══════════════════════════════════════════════════════════════════╝\n"
     + R + CY
-    + "  [ NVD · OSV · GHSA · CIRCL · Snyk · GitHub · VirusTotal · HybridAnalysis · Groq LLM ]\n"
+    + "  [ NVD · OSV · GHSA · OSS Index · GitHub · VirusTotal · HybridAnalysis · Groq LLM ]\n"
     + R)
+    # NOTE: CIRCL was removed from actual vulnerability collection (it duplicated
+    # NVD with no added signal — see collect_vulns()) but was still being listed
+    # here and in the PDF report as if it were a live source. Fixed in v9.
+
+
+# =============================================================================
+# SCORING ENGINE — standardized, versioned, policy-driven
+# =============================================================================
+# Design goals (see PROJECT NOTES at top of file, v9 changelog):
+#   1. Every constant that affects a score lives in one place (SCORING_POLICY),
+#      not scattered as inline magic numbers — and can be overridden with
+#      --policy file.json without touching code.
+#   2. CVE / dependency severity uses real CVSS scores blended with EPSS
+#      (exploit-probability) data OSTE already fetches, instead of a flat
+#      per-severity-bucket headcount that ignored both.
+#   3. A single OVERALL score exists (previous versions only drew six
+#      independent bars with nothing combining them).
+#   4. Hard gates can cap the overall score DOWN for a catastrophic single
+#      finding (e.g. an actively-exploited critical CVE) — a weighted average
+#      alone lets one bad dimension get diluted away by five fine ones.
+#   5. The deterministic score is authoritative for risk_level/verdict; the
+#      AI's own opinion is retained separately as advisory narrative and
+#      flagged if it disagrees, never silently overriding the deterministic
+#      result. See reconcile_signals().
+#
+# IMPORTANT — what this engine is NOT:
+#   - "repo_trust" is a Scorecard-*inspired* locally computed approximation
+#     using the same GitHub signals OSTE already collects. It does not call
+#     the official OpenSSF Scorecard API/binary.
+#   - These weights/thresholds are a documented starting policy, not a
+#     benchmarked model. They have not been calibrated against a labeled set
+#     of known-good / known-bad repositories. Treat scoring_policy_version
+#     "1.0.0" as a first draft meant to be tuned with real data over time,
+#     not as a validated risk model.
+# =============================================================================
+
+SCORING_POLICY_VERSION = "1.0.0"
+
+DEFAULT_SCORING_POLICY = {
+    "version": SCORING_POLICY_VERSION,
+    "description": (
+        "Default OSTE scoring policy. Override with --policy file.json — "
+        "only the keys present in your file are overridden, everything else "
+        "falls back to these defaults, so a partial override file is safe."
+    ),
+
+    "repo_trust": {
+        "base": 5.0, "star_threshold": 100, "star_bonus": 1.0,
+        "contributor_threshold": 5, "contributor_bonus": 1.0,
+        "not_archived_bonus": 1.0, "security_md_bonus": 1.0, "ci_bonus": 1.0,
+        "max": 10.0,
+    },
+
+    "license_safety": {"LOW": 10.0, "MEDIUM": 6.0, "HIGH": 3.0, "default": 5.0},
+
+    "cve_exposure": {
+        "severity_points_fallback": {   # used only when a CVSS base score is missing
+            "CRITICAL": 9.5, "HIGH": 7.5, "MEDIUM": 5.0, "LOW": 2.0, "UNKNOWN": 0.0},
+        "epss_floor_weight":   0.5,     # a CVE with EPSS=0 still counts at 50% of its severity
+        "epss_ceiling_weight": 0.5,     # + up to another 50%, scaled by exploit probability
+        "secondary_cve_penalty":     0.5,
+        "secondary_cve_penalty_cap": 3.0,
+        "secondary_cve_threshold":   4.0,   # only CVEs with weighted impact >= this count as "significant"
+        "max": 10.0,
+    },
+
+    "dependency_health": {
+        "dependency_weight_factor": 0.7,    # a transitive dependency CVE counts for less than a direct repo CVE
+        "severity_points_fallback": {
+            "CRITICAL": 9.5, "HIGH": 7.5, "MEDIUM": 5.0, "LOW": 2.0, "UNKNOWN": 0.0},
+        "epss_floor_weight": 0.5, "epss_ceiling_weight": 0.5,
+        "secondary_penalty": 0.4, "secondary_penalty_cap": 3.0, "secondary_threshold": 3.5,
+        "max": 10.0,
+    },
+
+    "security_posture": {
+        "base": 5.0, "security_md_bonus": 2.0, "ci_bonus": 2.0, "readme_bonus": 1.0, "max": 10.0,
+    },
+
+    "web_threat_intel": {
+        "zero_alarms": 10.0,
+        "low_alarms_max": 2,  "low_alarms_score": 8.0,
+        "mid_alarms_max": 5,  "mid_alarms_score": 5.0,
+        "high_alarms_score": 2.0,
+        "epss_high_prob_penalty":   2.0,
+        "epss_high_prob_threshold": 0.5,
+        "min": 0.0,
+    },
+
+    "file_scan": {
+        "clean_score": 10.0, "suspicious_score": 5.0, "malicious_score": 0.0, "unknown_score": 4.0,
+        "ha_suspicious_threshold": 30, "ha_malicious_threshold": 70,
+    },
+
+    # Weighted-average combination — each set should sum to 1.0.
+    "weights_opensource": {
+        "repo_trust": 0.15, "license_safety": 0.15, "cve_exposure": 0.30,
+        "dependency_health": 0.20, "security_posture": 0.10, "web_threat_intel": 0.10,
+    },
+    "weights_freeware": {
+        "cve_exposure": 0.30, "file_scan": 0.35, "dependency_health": 0.05,
+        "license_safety": 0.05, "web_threat_intel": 0.15, "security_posture": 0.10,
+    },
+
+    # Hard gates — can only cap the weighted average DOWN, never raise it.
+    "gates": {
+        "license_high_risk_cap": 4.0,
+        "archived_or_abandoned_cap": 5.0,
+        "abandoned_min_contributors": 1,
+        "critical_exploited_cap": 2.0,
+        "critical_exploited_cvss_threshold": 9.0,
+        "critical_exploited_epss_threshold": 0.5,
+        "freeware_malicious_score": 0.0,
+    },
+
+    # Deterministic tiering — overall score -> (risk_level, verdict). Checked
+    # top-down; first tier whose "min" the score meets or exceeds wins.
+    "tiers": [
+        {"min": 8.0, "risk_level": "LOW",      "verdict": "Safe to use"},
+        {"min": 5.0, "risk_level": "MEDIUM",   "verdict": "Use with caution"},
+        {"min": 3.0, "risk_level": "HIGH",     "verdict": "Use with caution"},
+        {"min": 0.0, "risk_level": "CRITICAL", "verdict": "Avoid"},
+    ],
+}
+
+
+def load_scoring_policy(path=None):
+    """
+    Load the scoring policy. Starts from DEFAULT_SCORING_POLICY and deep-merges
+    an optional override file on top, so a partial override (e.g. just
+    {"gates": {"critical_exploited_cap": 1.0}}) is safe — anything you don't
+    specify falls back to the default.
+    """
+    policy = json.loads(json.dumps(DEFAULT_SCORING_POLICY))  # cheap deep copy
+    if path:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                override = json.load(f)
+
+            def _deep_merge(base, over):
+                for k, v in over.items():
+                    if isinstance(v, dict) and isinstance(base.get(k), dict):
+                        _deep_merge(base[k], v)
+                    else:
+                        base[k] = v
+
+            _deep_merge(policy, override)
+            ok(f"Scoring policy: loaded overrides from {path} "
+               f"(base version {DEFAULT_SCORING_POLICY['version']})")
+        except Exception as e:
+            warn(f"Could not load scoring policy '{path}': {e} — using embedded defaults")
+    return policy
+
+
+def _severity_points(severity, cvss_score, fallback_table):
+    """Prefer a real CVSS base score (0-10). Only fall back to a severity-
+    bucket estimate when no CVSS number is available at all."""
+    try:
+        if cvss_score is not None:
+            return max(0.0, min(float(cvss_score), 10.0))
+    except (TypeError, ValueError):
+        pass
+    return fallback_table.get((severity or "UNKNOWN").upper(), fallback_table.get("UNKNOWN", 0.0))
+
+
+def score_repo_trust(auth, policy):
+    """
+    Repo-trust dimension. Same GitHub signals OSTE already collects (stars,
+    contributors, archived state, SECURITY.md, CI) as a weighted checklist —
+    NOT a call to the official OpenSSF Scorecard API/binary, just inspired by
+    the same idea of "many small maintenance signals, not one big number."
+    """
+    p = policy["repo_trust"]
+    if not auth or auth.get("error"):
+        return p["base"]
+    s = p["base"]
+    try:
+        stars = int(str(auth.get("stars", 0)).replace(",", ""))
+    except (TypeError, ValueError):
+        stars = 0
+    if stars > p["star_threshold"]:
+        s += p["star_bonus"]
+    if (auth.get("contributors_count") or 0) > p["contributor_threshold"]:
+        s += p["contributor_bonus"]
+    if not auth.get("is_archived"):
+        s += p["not_archived_bonus"]
+    if auth.get("has_security_md"):
+        s += p["security_md_bonus"]
+    if auth.get("ci_workflows"):
+        s += p["ci_bonus"]
+    return round(min(s, p["max"]), 2)
+
+
+def score_license_safety(license_risk, policy):
+    p = policy["license_safety"]
+    return p.get((license_risk or "").upper(), p["default"])
+
+
+def score_cve_exposure(cves, epss_scores, policy):
+    """
+    CVSS x EPSS blended severity, worst-case dominant, with a smaller
+    incremental penalty for additional significant CVEs. Replaces the old
+    fixed per-bucket count (CRITICAL*4 + HIGH*2 + MEDIUM*1) which ignored
+    real CVSS scores and exploitation likelihood entirely, and which treated
+    all CRITICALs as identical regardless of whether they were a 9.1 or a 10.0.
+    """
+    p = policy["cve_exposure"]
+    epss_scores = epss_scores or {}
+    if not cves:
+        return p["max"]
+    weighted = []
+    for c in cves:
+        base = _severity_points(c.get("severity"), c.get("cvss_score"), p["severity_points_fallback"])
+        epss = epss_scores.get(c.get("id", ""), 0.0) or 0.0
+        impact = base * (p["epss_floor_weight"] + p["epss_ceiling_weight"] * epss)
+        weighted.append(impact)
+    weighted.sort(reverse=True)
+    worst = weighted[0]
+    secondary_count = sum(1 for w in weighted[1:] if w >= p["secondary_cve_threshold"])
+    penalty = min(secondary_count * p["secondary_cve_penalty"], p["secondary_cve_penalty_cap"])
+    score = p["max"] - worst - penalty
+    return round(max(0.0, min(score, p["max"])), 2)
+
+
+def score_dependency_health(vulnerable_packages, epss_scores, policy):
+    """
+    Same CVSS x EPSS blended approach as CVE exposure, scaled down by
+    dependency_weight_factor since a transitive dependency vuln is one step
+    removed from the repo itself. Replaces the old flat "-2 per vulnerable
+    package" headcount, which scored one low-severity dependency identically
+    to one actively-exploited critical dependency.
+    """
+    p = policy["dependency_health"]
+    epss_scores = epss_scores or {}
+    if not vulnerable_packages:
+        return p["max"]
+    weighted = []
+    for v in vulnerable_packages:
+        base = _severity_points(v.get("severity"), v.get("cvss_score"), p["severity_points_fallback"])
+        epss = epss_scores.get(v.get("vuln_id", ""), 0.0) or 0.0
+        impact = base * (p["epss_floor_weight"] + p["epss_ceiling_weight"] * epss) * p["dependency_weight_factor"]
+        weighted.append(impact)
+    weighted.sort(reverse=True)
+    worst = weighted[0]
+    secondary_count = sum(1 for w in weighted[1:] if w >= p["secondary_threshold"])
+    penalty = min(secondary_count * p["secondary_penalty"], p["secondary_penalty_cap"])
+    score = p["max"] - worst - penalty
+    return round(max(0.0, min(score, p["max"])), 2)
+
+
+def score_security_posture(auth, policy):
+    p = policy["security_posture"]
+    if not auth or auth.get("error"):
+        return p["base"]
+    s = p["base"]
+    if auth.get("has_security_md"): s += p["security_md_bonus"]
+    if auth.get("ci_workflows"):     s += p["ci_bonus"]
+    if auth.get("has_readme"):       s += p["readme_bonus"]
+    return round(min(s, p["max"]), 2)
+
+
+def score_web_threat_intel(alarming_findings, epss_scores, policy):
+    """
+    Graduated instead of the old strict binary (5 or 8, nothing else — one
+    alarming hit and fifty alarming hits used to score identically). Now
+    scales with how many alarming findings surfaced, with an extra penalty
+    if any CVE in scope has a high real-world exploitation probability.
+    """
+    p = policy["web_threat_intel"]
+    n = len(alarming_findings or [])
+    if n == 0:
+        score = p["zero_alarms"]
+    elif n <= p["low_alarms_max"]:
+        score = p["low_alarms_score"]
+    elif n <= p["mid_alarms_max"]:
+        score = p["mid_alarms_score"]
+    else:
+        score = p["high_alarms_score"]
+    epss_scores = epss_scores or {}
+    if epss_scores and max(epss_scores.values(), default=0.0) >= p["epss_high_prob_threshold"]:
+        score -= p["epss_high_prob_penalty"]
+    return round(max(p["min"], score), 2)
+
+
+def score_file_scan(vt, ha, policy):
+    """
+    Freeware installer verdict. Explicit MALICIOUS branch — the old formula
+    only reached its worst bucket by elimination (else: 2), meaning a
+    confirmed-malicious verdict and a merely-inconclusive scan scored
+    identically. This version separates them explicitly.
+    """
+    p = policy["file_scan"]
+    vt = vt or {}; ha = ha or {}
+    vt_v = (vt.get("verdict") or "UNKNOWN").upper()
+    ha_v = (ha.get("verdict") or "UNKNOWN").upper()
+    ha_score = ha.get("threat_score")
+    try:
+        ha_score = float(ha_score)
+    except (TypeError, ValueError):
+        ha_score = None
+
+    if vt_v == "MALICIOUS" or ha_v == "MALICIOUS" or \
+       (ha_score is not None and ha_score >= p["ha_malicious_threshold"]):
+        return p["malicious_score"]
+    if vt_v == "CLEAN" and (ha_score is None or ha_score < p["ha_suspicious_threshold"]):
+        return p["clean_score"]
+    if vt_v == "SUSPICIOUS" or \
+       (ha_score is not None and p["ha_suspicious_threshold"] <= ha_score < p["ha_malicious_threshold"]):
+        return p["suspicious_score"]
+    return p["unknown_score"]
+
+
+def compute_overall_score(dim_scores, context, flow, policy):
+    """
+    Weighted average of the dimension scores, then hard gates that can only
+    cap the score DOWN, never up — the "worst dimension can override the
+    average" principle, so a single catastrophic finding isn't diluted away
+    by five unrelated dimensions looking fine.
+    Returns (overall_score: float, gates_triggered: list[str]).
+    """
+    weights = policy["weights_freeware"] if flow == "freeware" else policy["weights_opensource"]
+    total_w = sum(weights.values()) or 1.0
+    weighted_avg = sum(dim_scores.get(k, 0.0) * w for k, w in weights.items()) / total_w
+
+    gates = policy["gates"]
+    triggered = []
+    overall = weighted_avg
+
+    lic_risk = (context.get("license_risk") or "").upper()
+    if lic_risk == "HIGH" and overall > gates["license_high_risk_cap"]:
+        overall = gates["license_high_risk_cap"]
+        triggered.append(f"License risk HIGH — score capped at {gates['license_high_risk_cap']}")
+
+    auth = context.get("auth") or {}
+    if flow != "freeware":
+        abandoned = (auth.get("is_archived")
+                     or (auth.get("contributors_count") or 0) <= gates["abandoned_min_contributors"])
+        if abandoned and overall > gates["archived_or_abandoned_cap"]:
+            overall = gates["archived_or_abandoned_cap"]
+            triggered.append(
+                f"Archived or single-contributor project — score capped at "
+                f"{gates['archived_or_abandoned_cap']}")
+
+    worst_cve = context.get("worst_cve") or {}
+    if (worst_cve.get("cvss_score") or 0) >= gates["critical_exploited_cvss_threshold"] \
+       and (worst_cve.get("epss") or 0) >= gates["critical_exploited_epss_threshold"]:
+        if overall > gates["critical_exploited_cap"]:
+            overall = gates["critical_exploited_cap"]
+            triggered.append(
+                f"Critical CVE with high real-world exploitation probability "
+                f"({worst_cve.get('id','?')}, EPSS={worst_cve.get('epss',0):.0%}) — "
+                f"score capped at {gates['critical_exploited_cap']}")
+
+    if flow == "freeware":
+        vt = context.get("vt") or {}; ha = context.get("ha") or {}
+        if (vt.get("verdict") or "").upper() == "MALICIOUS" or (ha.get("verdict") or "").upper() == "MALICIOUS":
+            overall = gates["freeware_malicious_score"]
+            triggered.append("VirusTotal or Hybrid Analysis returned a MALICIOUS verdict — hard fail")
+
+    return round(max(0.0, min(overall, 10.0)), 2), triggered
+
+
+def deterministic_tier(overall_score, policy):
+    """overall score -> (risk_level, verdict), per policy["tiers"] (checked top-down)."""
+    for tier in policy["tiers"]:
+        if overall_score >= tier["min"]:
+            return tier["risk_level"], tier["verdict"]
+    last = policy["tiers"][-1]
+    return last["risk_level"], last["verdict"]
+
+
+def reconcile_signals(det_level, ai_level):
+    """
+    The deterministic score/gate layer is authoritative for the decision that
+    gets acted on (risk_level/verdict in the report). The AI's own opinion is
+    retained and shown, but never allowed to silently override it — this just
+    flags when the two disagree so a human notices, rather than picking one
+    without saying so.
+    """
+    if not ai_level:
+        return False
+    return det_level != ai_level.upper()
 
 
 # =============================================================================
 # PHASE 1 -- DEPENDENCIES
 # =============================================================================
+def _pip_install(pip_name, extra_args):
+    """
+    Run `python -m pip install <extra_args> <pip_name>`, capturing real
+    output instead of DEVNULL. The previous version discarded pip's actual
+    error, so a genuine cause (proxy block, SSL interception, permission
+    error) was invisible — the user only ever saw the generic ImportError
+    that happens *after* the real failure, which is misleading.
+    """
+    cmd = [sys.executable, "-m", "pip", "install",
+           "--disable-pip-version-check", *extra_args, pip_name]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if proc.returncode == 0:
+            return True, ""
+        detail = (proc.stderr or proc.stdout or "").strip()
+        return False, detail
+    except Exception as e:
+        return False, str(e)
+
+
 def ensure_packages():
-    pkgs = [("requests","requests"), ("reportlab","reportlab")]
+    """
+    Installs requests + reportlab if missing, trying several strategies
+    (plain, --user, and --trusted-host variants for environments where a
+    corporate proxy/SSL-intercepting firewall blocks the normal pip path —
+    the same kind of environment this script already assumes elsewhere,
+    since it disables SSL verification for its own HTTP calls).
+
+    Returns the set of import names still missing after every strategy has
+    been tried, so main() can decide whether to hard-stop. `requests` is
+    required for literally every network call this tool makes; `reportlab`
+    only disables the PDF report (JSON still works), so it's non-fatal.
+    """
+    pkgs = [("requests", "requests"), ("reportlab", "reportlab")]
+    still_missing = set()
+
     for pip_name, import_name in pkgs:
         try:
             importlib.import_module(import_name)
+            continue
         except ImportError:
-            print(f"  [*] Installing missing package: {pip_name} ...")
-            for extra_args in (["--user"], []):
+            pass
+
+        print(f"  [*] Installing missing package: {pip_name} ...")
+        strategies = [
+            ["--user"],
+            [],
+            ["--user", "--trusted-host", "pypi.org",
+             "--trusted-host", "files.pythonhosted.org",
+             "--trusted-host", "pypi.python.org"],
+            ["--trusted-host", "pypi.org",
+             "--trusted-host", "files.pythonhosted.org",
+             "--trusted-host", "pypi.python.org"],
+        ]
+        last_detail = ""
+        installed = False
+        for extra_args in strategies:
+            success, detail = _pip_install(pip_name, extra_args)
+            if success:
                 try:
-                    subprocess.check_call(
-                        [sys.executable,"-m","pip","install","--quiet",
-                         "--disable-pip-version-check", *extra_args, pip_name],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     importlib.invalidate_caches()
                     importlib.import_module(import_name)
                     print(f"  [+] Installed: {pip_name}")
+                    installed = True
                     break
-                except Exception as e:
-                    last_err = e
-            else:
-                print(f"  [!] Could not install {pip_name}: {last_err}")
-                print(f"  [!] Please run manually: pip install {pip_name}")
+                except ImportError:
+                    last_detail = "pip reported success but the module still won't import — " \
+                                   "possible mismatch between the pip and python being used"
+                    continue
+            last_detail = detail
+
+        if not installed:
+            still_missing.add(import_name)
+            print(f"  [!] Could not install {pip_name} automatically.")
+            if last_detail:
+                print(f"  [!] pip's actual error (this is the real cause — act on this, "
+                      f"not on any 'No module named' message that follows):")
+                for line in last_detail.splitlines()[-12:]:
+                    print(f"        {line}")
+            print(f"  [!] Fix manually, then re-run this script:")
+            print(f"        {sys.executable} -m pip install {pip_name}")
+            print(f"      If that also fails with an SSL/certificate or 'connection refused' error,")
+            print(f"      you're likely behind a proxy or firewall blocking pypi.org. Ask your network")
+            print(f"      team, or set a proxy environment variable first, e.g.:")
+            print(f"        set HTTPS_PROXY=http://your-proxy:port      (Windows cmd)")
+            print(f"        $env:HTTPS_PROXY=\"http://your-proxy:port\"   (PowerShell)")
+            print(f"        export HTTPS_PROXY=http://your-proxy:port   (macOS/Linux)")
+
     try:
         import urllib3 as _u3
         _u3.disable_warnings()
     except Exception:
         pass
+
+    return still_missing
 
 
 # =============================================================================
@@ -1317,7 +1756,7 @@ def _check_snyk(name, ecosystem, version=None, timeout=12):
             headers = {
                 "Authorization": f"token {SNYK_TOKEN}",
                 "Accept": "application/json",
-                "User-Agent": "OSFWTE8-SecurityAnalyzer/8"
+                "User-Agent": "OSTE-SecurityAnalyzer/9"
             }
             r = req.get(api_url, headers=headers, timeout=timeout, verify=True)
             if r.status_code == 200:
@@ -1364,7 +1803,7 @@ def _check_snyk(name, ecosystem, version=None, timeout=12):
             json={"coordinates": [purl]},
             headers={"Content-Type": "application/json",
                      "Accept": "application/json",
-                     "User-Agent": "OSFWTE8-SecurityAnalyzer/8"},
+                     "User-Agent": "OSTE-SecurityAnalyzer/9"},
             timeout=timeout, verify=True)
 
         if r.status_code == 200:
@@ -1973,12 +2412,16 @@ def gather_web_intel_opensource(info, timeout=20):
     # ── 6. EPSS scores for top CVEs — flag actively exploited ones ────────────
     # EPSS (exploit.prediction.scoring.system) gives a daily probability score
     # for each CVE being exploited in the wild. Free, no key, JSON API.
-    top_cves = info.get("_top_cves",[])        # injected by run() from vulns
+    top_cves  = info.get("_top_cves",[])        # injected by run() from vulns
+    epss_map  = {}   # NEW in v9: structured {cve_id: epss_score} for the scoring engine
+                      # (previously EPSS values only existed as free-text strings below,
+                      # unusable by anything except a human reading the report)
     if top_cves:
         step(f"[WEB-OS] Fetching EPSS exploit scores for {min(len(top_cves),20)} CVEs")
         for cve_id in top_cves[:20]:
             epss, pct = _epss_score(cve_id)
             if epss is not None:
+                epss_map[cve_id] = epss
                 label = "EXPLOITED-IN-WILD" if epss >= 0.1 else "low-exploit-prob"
                 entry = f"[EPSS] {cve_id} score={epss:.4f} ({pct*100:.1f}th percentile)"
                 results.append({"title":entry,"snippet":"","url":f"https://epss.cyentia.com/?cve={cve_id}",
@@ -2005,6 +2448,7 @@ def gather_web_intel_opensource(info, timeout=20):
         "security_hits":     len(alarming),
         "alarming_findings": alarming,
         "all_results":       results[:40],
+        "epss_scores":       epss_map,   # NEW in v9 — consumed by the scoring engine
     }
 
 
@@ -3014,10 +3458,14 @@ def _groq_call(messages, max_tokens, temperature, step_label):
     or None on complete failure. Used by both the filter and assessment steps.
     """
     import requests as req
+    # NOTE (Aug 2026): llama-3.3-70b-versatile and llama-3.1-8b-instant were
+    # shut down by Groq on 08/16/26; llama-3.1-70b-versatile has been dead
+    # since 01/24/25. Updated to Groq's current recommended replacements
+    # (see https://console.groq.com/docs/deprecations).
     GROQ_MODELS = [
-        "llama-3.3-70b-versatile",
-        "llama-3.1-70b-versatile",
-        "llama-3.1-8b-instant",
+        "openai/gpt-oss-120b",
+        "qwen/qwen3.6-27b",
+        "openai/gpt-oss-20b",
     ]
     for model in GROQ_MODELS:
         try:
@@ -3094,11 +3542,13 @@ def llm_assess(prompt):
 
     SYS_ASSESS = (
         "You are a senior cybersecurity expert conducting a formal software security assessment. "
-        "The findings below have already been filtered — all false positives and noise have been "
-        "removed by a separate triage step. Every finding you see is confirmed or plausibly "
-        "relevant to this specific software. "
+        "The findings below are the raw results collected directly from GitHub, NVD, OSV, GHSA, "
+        "OSS Index, web search, and (for freeware) VirusTotal/Hybrid Analysis — use your judgement "
+        "about which findings are actually relevant to this specific software. "
         "Your task is exclusively to assess risk and produce actionable recommendations. "
-        "Do NOT re-filter or second-guess the findings — they are clean. "
+        "Note: a separate, deterministic rule-based score is computed independently of your response "
+        "and is the authoritative decision in the final report — your assessment is shown alongside it "
+        "as expert narrative context, not as the final approval decision. "
         "Respond ONLY with a valid JSON object, no markdown fences, no preamble. "
         "Required keys: risk_level (LOW/MEDIUM/HIGH/CRITICAL), "
         "verdict (Safe to use / Use with caution / Avoid), "
@@ -3151,7 +3601,7 @@ def _row(label, value, col=""):
 
 def print_findings(auth, vulns, deps, web, file_scan=None, flow="opensource"):
     print(f"\n{B}{CY}{'#'*70}{R}")
-    print(f"{B}{CY}   COMPLETE FINDINGS REPORT  --  v8  --  Flow: {flow.upper()}{R}")
+    print(f"{B}{CY}   COMPLETE FINDINGS REPORT  --  v9  --  Flow: {flow.upper()}{R}")
     print(f"{B}{CY}{'#'*70}{R}")
 
     # ── REPO AUTHENTICITY (OS flow only) ──────────────────────────────────────
@@ -3550,18 +4000,94 @@ def run(args):
     # ── LLM ASSESSMENT ───────────────────────────────────────────────────────
     assessment = llm_assess(prompt)
 
+    # ── DETERMINISTIC SCORING ENGINE (v9 — separate from the AI call above) ──
+    # Computed once, here, from the same raw data the AI prompt was built
+    # from. This is the ONLY place scores are computed — generate_pdf_report()
+    # just renders whatever this block puts into `report`, so the PDF and the
+    # JSON can never disagree with each other.
+    step("Computing deterministic risk scores (rule-based — separate from the AI call above)")
+    policy = load_scoring_policy(getattr(args, "policy", None))
+
+    epss_scores = (web or {}).get("epss_scores", {}) if flow == "opensource" else {}
+    lic_risk_ctx = (auth.get("license_info", {}) or {}).get("risk", "MEDIUM") if flow == "opensource" else "MEDIUM"
+    vuln_pkgs_ctx = deps.get("vulnerable_packages", []) if flow == "opensource" else []
+    alarming_ctx  = (web or {}).get("alarming_findings", [])
+    all_cves_ctx  = vulns.get("cves", [])
+
+    dim_scores = {}
+    if flow == "opensource":
+        dim_scores["repo_trust"]        = score_repo_trust(auth, policy)
+        dim_scores["license_safety"]    = score_license_safety(lic_risk_ctx, policy)
+        dim_scores["cve_exposure"]      = score_cve_exposure(all_cves_ctx, epss_scores, policy)
+        dim_scores["dependency_health"] = score_dependency_health(vuln_pkgs_ctx, epss_scores, policy)
+        dim_scores["security_posture"]  = score_security_posture(auth, policy)
+        dim_scores["web_threat_intel"]  = score_web_threat_intel(alarming_ctx, epss_scores, policy)
+    else:
+        dim_scores["cve_exposure"]      = score_cve_exposure(all_cves_ctx, {}, policy)
+        dim_scores["file_scan"]         = score_file_scan(file_scan.get("virustotal"),
+                                                            file_scan.get("hybrid_analysis"), policy)
+        # These three dimensions have no real data source in the freeware flow
+        # (no dependency list, no license, no repo metadata are ever collected
+        # for it) — they resolve to fixed defaults below rather than measuring
+        # anything. Shown in the report as "not applicable to this flow" rather
+        # than silently presented as real 10/10, 5/10, 5/10 measurements.
+        dim_scores["dependency_health"] = score_dependency_health([], {}, policy)
+        dim_scores["license_safety"]    = score_license_safety("MEDIUM", policy)
+        dim_scores["security_posture"]  = score_security_posture({}, policy)
+        dim_scores["web_threat_intel"]  = score_web_threat_intel(alarming_ctx, {}, policy)
+
+    # Worst CVE (by severity) drives the "actively exploited critical" gate.
+    worst_cve_ctx = {}
+    if all_cves_ctx:
+        def _cve_impact(c):
+            return _severity_points(c.get("severity"), c.get("cvss_score"),
+                                     policy["cve_exposure"]["severity_points_fallback"])
+        worst = max(all_cves_ctx, key=_cve_impact)
+        worst_cve_ctx = {"id": worst.get("id"), "cvss_score": worst.get("cvss_score"),
+                          "epss": epss_scores.get(worst.get("id",""), 0.0)}
+
+    score_context = {
+        "license_risk": lic_risk_ctx,
+        "auth":         auth,
+        "worst_cve":    worst_cve_ctx,
+        "vt":           file_scan.get("virustotal"),
+        "ha":           file_scan.get("hybrid_analysis"),
+    }
+    overall_score, gates_triggered = compute_overall_score(dim_scores, score_context, flow, policy)
+    det_level, det_verdict = deterministic_tier(overall_score, policy)
+
+    ai_level        = assessment.get("risk_level", "UNKNOWN")
+    ai_verdict_text = assessment.get("verdict", "")
+    signal_conflict = reconcile_signals(det_level, ai_level)
+
+    ok(f"Deterministic overall score: {overall_score}/10  →  {det_level} / {det_verdict}  "
+       f"(policy v{policy.get('version')})")
+    for g in gates_triggered:
+        warn(f"GATE: {g}")
+    if signal_conflict:
+        warn(f"Signal conflict — deterministic says {det_level}/{det_verdict!r}, "
+             f"AI says {ai_level}/{ai_verdict_text!r}. Deterministic result is authoritative.")
+
+    # ── DETERMINISTIC RESULT IS AUTHORITATIVE for risk_level/verdict ─────────
+    # (previously this came straight from the AI's own risk_level field)
     elapsed = round(time.time() - start, 1)
-    risk    = assessment.get("risk_level","UNKNOWN").upper()
+    risk    = det_level
     col     = RISK_COL.get(risk, GY)
 
     print(f"\n{col}{B}")
     print(f"  +{'--'*32}+")
     print(f"  |  FLOW      : {flow.upper():<{60 - 12}}|")
     print(f"  |  RISK LEVEL: {risk:<{60 - 12}}|")
-    print(f"  |  VERDICT   : {assessment.get('verdict','N/A'):<{60 - 12}}|")
+    print(f"  |  VERDICT   : {det_verdict:<{60 - 12}}|")
     print(f"  +{'--'*32}+{R}")
 
-    print(f"\n{B}  Explanation:{R}")
+    print(f"\n{B}  Overall score:{R} {overall_score}/10  (deterministic, policy v{policy.get('version')})")
+    print(f"\n{B}  AI opinion (advisory — shown for context, does not override the result above):{R}")
+    print(f"    risk_level = {ai_level}   verdict = {ai_verdict_text!r}")
+    if signal_conflict:
+        print(f"{YL}{B}  [!] AI and deterministic scoring disagree — deterministic result is authoritative.{R}")
+
+    print(f"\n{B}  Explanation (AI-written, based on the findings above):{R}")
     for s in assessment.get("explanation","").split(". "):
         if s.strip(): print(f"    * {s.strip()}.")
 
@@ -3601,8 +4127,19 @@ def run(args):
         "dependencies":     deps,
         "web_intel":        web,
         "file_scan":        file_scan,
-        "risk_level":       risk,
-        "verdict":          assessment.get("verdict"),
+
+        # ── Deterministic scoring engine (v9) — rule-based, no AI, authoritative ──
+        "scoring_policy_version": policy.get("version"),
+        "dimension_scores":       dim_scores,
+        "overall_score":          overall_score,
+        "gates_triggered":        gates_triggered,
+        "risk_level":             risk,        # = det_level    (key name unchanged from v8)
+        "verdict":                det_verdict, # = deterministic verdict (key name unchanged from v8)
+
+        # ── AI assessment (Groq) — advisory narrative, shown but not authoritative ──
+        "ai_risk_level":    ai_level,
+        "ai_verdict":       ai_verdict_text,
+        "signal_conflict":  signal_conflict,
         "llm_analysis":     assessment.get("explanation"),
         "license_verdict":  assessment.get("license_verdict",""),
         "bundleware_risk":  assessment.get("bundleware_risk",""),
@@ -3847,7 +4384,7 @@ def generate_pdf_report(report, out_dir):
             analyzed = report.get("analyzed_at","")[:19].replace("T"," ")
             elapsed  = report.get("elapsed_seconds","?")
             c.drawString(10*mm, 7*mm,
-                f"Analyzed {analyzed} UTC   |   Duration {elapsed}s   |   OSFWTE8 Security Analyzer")
+                f"Analyzed {analyzed} UTC   |   Duration {elapsed}s   |   OSTE Security Analyzer")
 
     # ── Build story ───────────────────────────────────────────────────────────
     story = []
@@ -3917,56 +4454,67 @@ def generate_pdf_report(report, out_dir):
     story.append(metric_t)
     story.append(sp(12))
 
-    # ── Dimension scores ──────────────────────────────────────────────────────
-    story.append(sec_hdr("Dimension scores"))
+    # ── Dimension scores (v9) ────────────────────────────────────────────────
+    # All six numbers below were computed ONCE in run(), by the deterministic
+    # scoring engine (see SCORING ENGINE section near the top of this file) —
+    # this block only RENDERS report["dimension_scores"], it does not compute
+    # anything itself, so the PDF and the saved JSON can never disagree.
+    flow_r = report.get("flow","")
+
+    story.append(sec_hdr("Dimension scores  (rule-based — not AI-generated)"))
     story.append(sp(4))
 
-    def _trust_score():
-        s = 5
-        if auth.get("stars",0) and int(str(auth.get("stars",0)).replace(",","")) > 100: s += 1
-        if auth.get("contributors_count",0) and auth["contributors_count"] > 5: s += 1
-        if not auth.get("is_archived"): s += 1
-        if auth.get("has_security_md"): s += 1
-        if auth.get("ci_workflows"): s += 1
-        return min(s, 10)
+    DIM_LABELS = {
+        "repo_trust":        "Repo trust & credibility",
+        "license_safety":    "Licence safety",
+        "cve_exposure":      "CVE / advisory exposure  (CVSS × EPSS)",
+        "dependency_health": "Dependency health  (CVSS × EPSS)",
+        "security_posture":  "Security posture",
+        "web_threat_intel":  "Web & threat intelligence",
+        "file_scan":         "File scan (VirusTotal + Hybrid Analysis)",
+    }
+    NOT_APPLICABLE_FREEWARE = {"dependency_health", "license_safety", "security_posture"}
 
-    cve_score = 10 if total_cv == 0 else max(0, 10 - min(sc.get("CRITICAL",0)*4 + sc.get("HIGH",0)*2 + sc.get("MEDIUM",0), 10))
-    lic_score = {"LOW":10,"MEDIUM":6,"HIGH":3}.get(lic_risk, 5)
-    dep_score = max(0, 10 - n_vuln_dep * 2)
-    trust_score = _trust_score()
-    sec_score = 5
-    if auth.get("has_security_md"): sec_score += 2
-    if auth.get("ci_workflows"):    sec_score += 2
-    if auth.get("has_readme"):      sec_score += 1
+    dim_scores_map = report.get("dimension_scores", {}) or {}
+    order = (["cve_exposure","file_scan","dependency_health","license_safety",
+              "web_threat_intel","security_posture"] if flow_r == "freeware" else
+             ["repo_trust","license_safety","cve_exposure","dependency_health",
+              "security_posture","web_threat_intel"])
+    for key in order:
+        if key not in dim_scores_map:
+            continue
+        label = DIM_LABELS.get(key, key)
+        if flow_r == "freeware" and key in NOT_APPLICABLE_FREEWARE:
+            label += "  (n/a for freeware — no source data)"
+        story.append(score_bar(label, dim_scores_map[key]))
+    story.append(sp(6))
 
-    flow_r = report.get("flow","")
-    if flow_r == "freeware":
-        vt = (file_sc.get("virustotal") or {})
-        ha = (file_sc.get("hybrid_analysis") or {})
-        vt_verdict = vt.get("verdict","UNKNOWN")
-        ha_score   = ha.get("threat_score") or 0
-        ft_score   = 10 if vt_verdict=="CLEAN" and ha_score < 30 else                      5  if vt_verdict=="SUSPICIOUS" or 30 <= ha_score < 70 else 2
-        dim_scores = [
-            ("CVE exposure",          cve_score),
-            ("File scan (VT + HA)",   ft_score),
-            ("Dependency health",      dep_score),
-            ("Licence safety",         lic_score),
-            ("Web & threat intel",     8 if not report.get("web_intel",{}).get("alarming_findings") else 5),
-            ("Overall security posture",sec_score),
-        ]
-    else:
-        dim_scores = [
-            ("Repo trust & credibility",  trust_score),
-            ("Licence safety",            lic_score),
-            ("CVE / advisory exposure",   cve_score),
-            ("Dependency health",         dep_score),
-            ("Security posture",          sec_score),
-            ("Web & threat intelligence", 8 if not report.get("web_intel",{}).get("alarming_findings") else 5),
-        ]
+    # Overall weighted + gated score — the single number the six bars above
+    # roll up into. Did not exist prior to v9; previously each bar stood alone.
+    overall = report.get("overall_score")
+    if overall is not None:
+        story.append(score_bar(
+            f"OVERALL  (weighted avg + hard gates, policy v{report.get('scoring_policy_version','?')})",
+            overall))
+    story.append(sp(4))
 
-    for lbl, scr in dim_scores:
-        story.append(score_bar(lbl, scr))
-    story.append(sp(12))
+    gates = report.get("gates_triggered") or []
+    if gates:
+        story.append(Paragraph("<b>Hard gates applied:</b>", sB))
+        story.append(sp(3))
+        for g in gates:
+            story.append(finding_row("GATE", str(g)[:170]))
+        story.append(sp(4))
+
+    if report.get("signal_conflict"):
+        story.append(finding_row(
+            "NOTICE",
+            "Deterministic scoring and the AI assessment disagree on risk level.",
+            f"Deterministic (authoritative): {report.get('risk_level')} / {report.get('verdict')}   "
+            f"|   AI (advisory): {report.get('ai_risk_level')} / {report.get('ai_verdict')}"))
+        story.append(sp(4))
+
+    story.append(sp(6))
 
     # ── OPEN SOURCE sections ───────────────────────────────────────────────────
     if flow_r == "opensource" and auth and not auth.get("error"):
@@ -4018,7 +4566,7 @@ def generate_pdf_report(report, out_dir):
     cves = vulns.get("cves",[])
     story.append(sec_hdr("CVE & Vulnerability Intelligence"))
     story.append(sp(4))
-    story.append(lv_row("Sources", "NVD · OSV.dev · GHSA · CIRCL"))
+    story.append(lv_row("Sources", "NVD · OSV.dev · GHSA"))
     story.append(lv_row("Total found", str(total_cv),
                          C_GREEN_MID if total_cv==0 else C_RED_MID))
     story.append(lv_row("Severity breakdown",
@@ -4057,7 +4605,7 @@ def generate_pdf_report(report, out_dir):
         story.append(cve_t)
     else:
         story.append(finding_row("CLEAN", "No CVEs found in any database",
-            "Searched NVD, OSV.dev, GHSA, and CIRCL — zero results for this tool."))
+            "Searched NVD, OSV.dev, and GHSA — zero results for this tool."))
     story.append(sp(10))
 
     # ── Dependencies ──────────────────────────────────────────────────────────
@@ -4178,7 +4726,7 @@ def generate_pdf_report(report, out_dir):
         story.append(sp(10))
 
     # ── LLM verdict ───────────────────────────────────────────────────────────
-    story.append(sec_hdr("LLM Assessment & Recommendations", r_bg, r_mid, r_tc))
+    story.append(sec_hdr("Risk Verdict (deterministic) & AI-Written Explanation", r_bg, r_mid, r_tc))
     story.append(sp(4))
 
     # Risk level box — no verdict text, just risk level + explanation
@@ -4243,7 +4791,7 @@ def generate_pdf_report(report, out_dir):
     story.append(sp(3))
     story.append(Paragraph(
         f"Report generated {datetime.now().strftime('%d %B %Y %H:%M')} UTC   |   "
-        "OSFWTE8 Security Analyzer   |   "
+        "OSTE Security Analyzer   |   "
         "Sources: NVD · OSV.dev · GHSA · OSS Index · GitHub · MalwareBazaar · VirusTotal · Hybrid Analysis",
         ParagraphStyle("ft", fontName="Helvetica-Oblique", fontSize=7,
                        textColor=C_MUTED, leading=10, alignment=TA_CENTER)))
@@ -4260,7 +4808,7 @@ def generate_pdf_report(report, out_dir):
         doc = SimpleDocTemplate(str(pdf_path), pagesize=A4,
             leftMargin=ML, rightMargin=MR, topMargin=MT, bottomMargin=MB,
             title=f"{tool_name} Security Assessment",
-            author="OSFWTE8 Security Analyzer")
+            author="OSTE Security Analyzer")
         doc.build(story)
         # Verify the file was actually written and is non-empty
         if not pdf_path.exists() or pdf_path.stat().st_size == 0:
@@ -4313,10 +4861,37 @@ def interactive_download_url():
 
 def main():
     print(BANNER)
-    ensure_packages()
+    missing = ensure_packages()
 
-    parser = argparse.ArgumentParser(prog="python OSFWTE8.py",
-        description="OS/FT Analyzer v8 -- Open Source / Freeware Tool Security Analyzer")
+    if "requests" in missing:
+        # Hard-stop here instead of limping through the whole pipeline —
+        # every single data source this tool uses (GitHub, NVD, OSV, GHSA,
+        # OSS Index, DuckDuckGo, EPSS, VirusTotal, Hybrid Analysis, Groq) goes
+        # through `requests`. Continuing without it previously produced a
+        # "COMPLETE FINDINGS REPORT" full of misleading zeros instead of an
+        # honest failure — that's worse than stopping.
+        fail("`requests` could not be installed and is required for every network "
+             "call this tool makes. Nothing will work without it — stopping here "
+             "rather than continuing with a broken run.")
+        print(f"\n{B}  Install it manually, then re-run this script:{R}")
+        print(f"    {sys.executable} -m pip install requests\n")
+        print(f"{DIM}  (See the pip error output above this message for the actual cause — "
+              f"'No module named requests' just means the install didn't succeed, it isn't "
+              f"itself the reason.){R}")
+        if sys.stdin.isatty():
+            print("\nPress Enter to exit...")
+            try: input()
+            except Exception: pass
+        sys.exit(1)
+
+    if "reportlab" in missing:
+        warn("`reportlab` could not be installed — the JSON report will still be "
+             "generated normally, but the PDF report will be skipped for this run. "
+             "See the pip error above for why, or install it manually: "
+             f"{sys.executable} -m pip install reportlab")
+
+    parser = argparse.ArgumentParser(prog="python OSTE.py",
+        description="OS/FT Analyzer v9 -- Open Source / Freeware Tool Security Analyzer")
     grp = parser.add_mutually_exclusive_group()
     grp.add_argument("-n","--name",   metavar="NAME", help="Freeware name (e.g. 'VLC')")
     grp.add_argument("-u","--url",    metavar="URL",  help="GitHub/Bitbucket repo URL")
@@ -4326,6 +4901,11 @@ def main():
         help="Skip web intelligence gathering")
     parser.add_argument("--skip-scan", action="store_true",
         help="Skip file download and scan (freeware only)")
+    parser.add_argument("--policy", metavar="FILE",
+        help=f"Path to a JSON file overriding the default scoring policy "
+             f"(base version {SCORING_POLICY_VERSION}). Only the keys you "
+             f"include are overridden — everything else falls back to the "
+             f"built-in defaults, so a partial file is safe.")
     parser.add_argument("--no-interactive", action="store_true",
         help="Run once and exit — no 'analyze another?' prompt (used by web UI)")
     parser.add_argument("--verbose","-v", action="store_true")
